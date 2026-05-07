@@ -83,7 +83,16 @@ class StfLegalPrecedent(BaseLegalPrecedent):
 
         return_value: list[Self] = []
         for result_locator in results_locators:
-            await result_locator.locator("app-clipboard").click()
+            # STF renderiza dois botões app-clipboard por resultado: "Copiar ementa"
+            # (mantém formatação) e "Copiar ementa sem formatação". Preferimos a
+            # versão formatada; sem isso, o strict mode do Patchright quebra ao
+            # encontrar 2 elementos.
+            clipboard_button = result_locator.locator(
+                'app-clipboard[tooltip="Copiar ementa"]'
+            )
+            if await clipboard_button.count() != 1:
+                clipboard_button = result_locator.locator("app-clipboard").first
+            await clipboard_button.click()
             handle = await browser.evaluate_handle(
                 "() => navigator.clipboard.readText()"
             )
