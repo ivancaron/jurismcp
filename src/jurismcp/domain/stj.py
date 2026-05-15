@@ -40,22 +40,99 @@ _HEADERS = {
     "Referer": "https://processo.stj.jus.br/SCON/",
 }
 
-# Regex to extract ementa text from textarea elements
-_EMENTA_PATTERN = re.compile(
+# --- Patterns for the SCON result template (refreshed by STJ ~2025-2026) -----
+#
+# Each acordao on the SCON result page is wrapped in
+#     <div class="row itemlistadocumentos p-2">...</div>
+# The block contains, in order:
+#   - process number inside <a href="/SCON/jurisprudencia/doc.jsp?...">REsp&nbsp;NNN</a>
+#   - class (ACORDAO etc.) in <div class="small">(CLASSE)</div>
+#   - relator in <div>Ministro/Ministra NAME</div>
+#   - DJe date in <div>DJe DD/MM/AAAA</div>
+#   - decision date in <div>Decisao: DD/MM/AAAA</div>
+#   - optional indicators (IAC, repetitivo) in <div class="indicaIAC">
+#   - summary ementa in <div class="clsResumoEmenta"> (with highlight markup)
+#   - full ementa in <div class="clsEmentaCompleta">...</div> (preferred)
+#
+# Legacy fallback (older template, may still appear on edge cases):
+#   - <a name="DOCN"></a> markers + <div class="documento"> blocks
+#   - <textarea id="textSemformatacao\d+"> for the ementa
+#   - inteiro_teor('/SCON/GetInteiroTeorDoAcordao?num_registro=...&dt_publicacao=...')
+
+_ITEM_BLOCK_SPLIT = re.compile(
+    r'(?=<div\s+class="row\s+itemlistadocumentos)',
+)
+_ITEM_BLOCK_START = re.compile(
+    r'^<div\s+class="row\s+itemlistadocumentos',
+)
+_PROCESSO_RE = re.compile(
+    r'<h4>\s*Processo\s*</h4>\s*<div>\s*<a[^>]*href="([^"]*)"[^>]*>([^<]+)</a>',
+    re.DOTALL,
+)
+_CLASSE_RE = re.compile(r'<div\s+class="small">\(([^)]+)\)</div>')
+_RELATOR_RE = re.compile(r'<div>\s*(Ministr[oa][^<]+?)\s*</div>')
+_DJE_RE = re.compile(r'<div>\s*(DJe[^<]+?)\s*</div>')
+_DECISAO_RE = re.compile(r'<div>\s*(Decis\w*:[^<]+?)\s*</div>')
+_INDICADORES_RE = re.compile(
+    r'<div\s+class="(?:indicaIAC|indicaRepetitivo|indicaAfetacao)[^"]*">'
+    r'\s*([^<]+?)\s*</div>',
+)
+_EMENTA_COMPLETA_RE = re.compile(
+    r'<div\s+class="clsEmentaCompleta"[^>]*>\s*(.*?)\s*</div>',
+    re.DOTALL,
+)
+_EMENTA_RESUMO_RE = re.compile(
+    r'<div\s+class="clsResumoEmenta"[^>]*>\s*(.*?)\s*</div>',
+    re.DOTALL,
+)
+_HIGHLIGHT_RE = re.compile(
+    r'<span\s+class=(?:"highlightBrs"|highlightBrs)[^>]*>(.*?)</span>',
+    re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+_HTML_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
+_NUM_DOCS_RE = re.compile(r'<span\s+class="numDocs">\s*([\d\.,]+)\s*ac[oó]rd[aã]os')
+
+# Legacy patterns (old template)
+_LEGACY_EMENTA_PATTERN = re.compile(
     r'<textarea[^>]*id="textSemformatacao\d+"[^>]*>(.*?)</textarea>',
     re.DOTALL,
 )
-
-# Each result block on the SCON HTML is wrapped by `<a name="DOCN"></a>` followed
-# by `<div class="documento">`. Inside each block there is exactly one
-# `inteiro_teor('/SCON/GetInteiroTeorDoAcordao?num_registro=...&dt_publicacao=...')`
-# call. We use `_DOC_BLOCK_PATTERN` to split the HTML into individual result
-# blocks, then `_INTEIRO_TEOR_PATTERN` extracts the URL parameters from each.
-_DOC_BLOCK_SPLIT = re.compile(r'<a name="DOC\d+"></a>', re.DOTALL)
-_INTEIRO_TEOR_PATTERN = re.compile(
+_LEGACY_DOC_BLOCK_SPLIT = re.compile(r'<a name="DOC\d+"></a>', re.DOTALL)
+_LEGACY_INTEIRO_TEOR_PATTERN = re.compile(
     r"GetInteiroTeorDoAcordao\?num_registro=(\d+)&(?:amp;)?dt_publicacao=([\d/]+)"
 )
 _STJ_BASE = "https://processo.stj.jus.br"
+
+
+def _clean_html_inline(fragment: str) -> str:
+    """Remove inline HTML markup from an ementa fragment.
+
+    The SCON ementa contains <br>, <span class=highlightBrs> (search term
+    highlights) and may include comments. We strip everything except the
+    plain text content and collapse whitespace."""
+    # Strip comments first (they can contain misleading content like "Campo TEMA")
+    text = _HTML_COMMENT_RE.sub(" ", fragment)
+    # Unwrap highlight spans, keeping their text
+    text = _HIGHLIGHT_RE.sub(lambda m: m.group(1), text)
+    # Replace <br> with newline
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # Strip remaining tags
+    text = _HTML_TAG_RE.sub("", text)
+    # Decode HTML entities the cheap way (covers the common cases in SCON)
+    text = (
+        text.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'")
+    )
+    # Collapse multi-space (but preserve newlines from <br>)
+    text = re.sub(r"[ \t]+", " ", text)
+    # Trim spaces around newlines
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    return text.strip()
 
 
 class StjLegalPrecedent(BaseLegalPrecedent):
@@ -129,41 +206,131 @@ class StjLegalPrecedent(BaseLegalPrecedent):
     def _parse_ementas(cls, html: str) -> list[Self]:
         """Extract ementa texts and inteiro-teor URLs from the HTML response.
 
-        Each `<div class="documento">` block contains both the ementa and a
-        link to the inteiro teor in the form `GetInteiroTeorDoAcordao?...`.
-        We split the HTML by `<a name="DOCN"></a>` markers and pair them up.
-        """
-        # Split by document markers — first chunk is the page header (no result)
-        chunks = _DOC_BLOCK_SPLIT.split(html)[1:]
+        The current SCON template (refreshed by STJ in 2025-2026) wraps each
+        acordao in ``<div class="row itemlistadocumentos p-2">`` and exposes
+        the full ementa inside ``<div class="clsEmentaCompleta">``. The
+        process number is rendered as an anchor whose href points to the
+        details page (``/SCON/jurisprudencia/doc.jsp?...``), which we use as
+        ``full_text_url``.
+
+        Falls back to the legacy template (``<a name="DOCN">`` markers +
+        ``<textarea id="textSemformatacao\\d+">``) when the modern block is
+        absent — useful for older fixtures or transitional templates."""
+        # First, try the modern template (current SCON, post-2025)
+        modern_results = cls._parse_modern_template(html)
+        if modern_results:
+            return modern_results
+
+        # No modern blocks — handle "no results" / error before falling back
+        if "Nenhum documento encontrado" in html:
+            _LOGGER.info("No legal precedents found for the given search")
+            return []
+
+        if "erroMensagem" in html:
+            error_match = re.search(
+                r'<div class="erroMensagem">(.*?)</div>', html, re.DOTALL
+            )
+            error_text = error_match.group(1).strip() if error_match else "Unknown"
+            _LOGGER.warning("SCON returned an error: %s", error_text)
+            return []
+
+        # Legacy template fallback
+        return cls._parse_legacy_template(html)
+
+    @classmethod
+    def _parse_modern_template(cls, html: str) -> list[Self]:
+        """Parse the current SCON template (``itemlistadocumentos`` blocks)."""
+        blocks = _ITEM_BLOCK_SPLIT.split(html)
+        results: list[Self] = []
+
+        for block in blocks:
+            if not _ITEM_BLOCK_START.match(block):
+                continue
+
+            # Prefer the full ementa; fall back to the resumo if absent
+            ementa_match = _EMENTA_COMPLETA_RE.search(block)
+            if not ementa_match:
+                ementa_match = _EMENTA_RESUMO_RE.search(block)
+            if not ementa_match:
+                continue
+
+            ementa_raw = ementa_match.group(1)
+            ementa_text = _clean_html_inline(ementa_raw)
+            if not ementa_text:
+                continue
+
+            # Metadata header
+            metadata_parts: list[str] = []
+            proc_m = _PROCESSO_RE.search(block)
+            href = proc_m.group(1) if proc_m else None
+            processo = (
+                _clean_html_inline(proc_m.group(2)) if proc_m else None
+            )
+            classe_m = _CLASSE_RE.search(block)
+            relator_m = _RELATOR_RE.search(block)
+            dje_m = _DJE_RE.search(block)
+            decisao_m = _DECISAO_RE.search(block)
+            indicador_m = _INDICADORES_RE.search(block)
+
+            if processo:
+                cabec = f"Processo: {processo}"
+                if classe_m:
+                    cabec += f" | Classe: {classe_m.group(1).strip()}"
+                metadata_parts.append(cabec)
+            if relator_m:
+                metadata_parts.append(f"Relator(a): {relator_m.group(1).strip()}")
+            if decisao_m:
+                metadata_parts.append(decisao_m.group(1).strip())
+            if dje_m:
+                metadata_parts.append(dje_m.group(1).strip())
+            if indicador_m:
+                metadata_parts.append(f"Indicador: {indicador_m.group(1).strip()}")
+
+            header = (
+                "[" + " | ".join(metadata_parts) + "]\n" if metadata_parts else ""
+            )
+            summary = header + ementa_text
+
+            # full_text_url — uses the doc.jsp href, made absolute
+            full_text_url: str | None = None
+            if href:
+                if href.startswith("http"):
+                    full_text_url = href
+                elif href.startswith("/"):
+                    full_text_url = f"{_STJ_BASE}{href}"
+
+            results.append(cls(summary=summary, full_text_url=full_text_url))
+
+        _LOGGER.debug(
+            "Modern template parsed %d result block(s); %d with inteiro-teor URL",
+            len(results),
+            sum(1 for r in results if r.full_text_url),
+        )
+        return results
+
+    @classmethod
+    def _parse_legacy_template(cls, html: str) -> list[Self]:
+        """Parse the legacy SCON template (``<a name='DOCN'>`` + textareas).
+
+        Kept as fallback for fixtures and transitional pages.  This is the
+        original parser preserved verbatim for compatibility."""
+        chunks = _LEGACY_DOC_BLOCK_SPLIT.split(html)[1:]
 
         if not chunks:
-            if "Nenhum documento encontrado" in html:
-                _LOGGER.info("No legal precedents found for the given search")
-                return []
-
-            if "erroMensagem" in html:
-                error_match = re.search(
-                    r'<div class="erroMensagem">(.*?)</div>', html, re.DOTALL
-                )
-                error_text = error_match.group(1).strip() if error_match else "Unknown"
-                _LOGGER.warning("SCON returned an error: %s", error_text)
-                return []
-
-            # Fallback: no document blocks but no clear error — try plain ementa extraction
-            matches = _EMENTA_PATTERN.findall(html)
+            # Plain ementa extraction when neither modern nor legacy markers exist
+            matches = _LEGACY_EMENTA_PATTERN.findall(html)
             return [cls(summary=text.strip()) for text in matches if text.strip()]
 
         results: list[Self] = []
         for chunk in chunks:
-            ementa_match = _EMENTA_PATTERN.search(chunk)
+            ementa_match = _LEGACY_EMENTA_PATTERN.search(chunk)
             if not ementa_match:
                 continue
             ementa = ementa_match.group(1).strip()
             if not ementa:
                 continue
 
-            # Each chunk should have exactly one inteiro teor URL
-            url_match = _INTEIRO_TEOR_PATTERN.search(chunk)
+            url_match = _LEGACY_INTEIRO_TEOR_PATTERN.search(chunk)
             full_text_url: str | None = None
             if url_match:
                 num_registro, dt_publicacao = url_match.group(1), url_match.group(2)
@@ -175,7 +342,7 @@ class StjLegalPrecedent(BaseLegalPrecedent):
             results.append(cls(summary=ementa, full_text_url=full_text_url))
 
         _LOGGER.debug(
-            "Parsed %d result block(s); %d with inteiro-teor URL",
+            "Legacy template parsed %d result block(s); %d with inteiro-teor URL",
             len(results),
             sum(1 for r in results if r.full_text_url),
         )

@@ -150,6 +150,165 @@ class TestStjParseEmentas:
 
 
 # ---------------------------------------------------------------------------
+# STJ — `_parse_modern_template` (post-2025 SCON refresh)
+# ---------------------------------------------------------------------------
+
+
+_STJ_MODERN_FIXTURE = textwrap.dedent(
+    """\
+    <html><body>
+    <div class="listaresumida">
+      <div class="row clsHeaderDocumento"><div class="col">Acordaos</div></div>
+      <div class="listadocumentos">
+        <div class="row itemlistadocumentos p-2">
+          <div class="col-sm-1"><h4>1</h4></div>
+          <div class="col-sm-3">
+            <h4>Processo</h4>
+            <div>
+              <a href="/SCON/jurisprudencia/doc.jsp?ementa=CONSUMIDOR&b=ACOR&i=1">REsp&nbsp;1896379</a>
+            </div>
+            <div class="small">(ACORDAO)</div>
+            <div>Ministro OG FERNANDES</div>
+            <div>DJe 13/12/2021</div>
+            <div>Decisao: 21/10/2021</div>
+          </div>
+          <div class="col-sm-8">
+            <div class="indicaIAC">INCIDENTE DE ASSUNCAO DE COMPETENCIA</div>
+            <h4>Ementa</h4>
+            <div class="clsResumoEmenta">
+              <!-- Campo TEMA: 1. Tema Repetitivo 10 -->
+              ...<br>RECURSO PROVIDO.
+            </div>
+            <div class="clsEmentaCompleta">
+              PROCESSUAL CIVIL. RECURSO ESPECIAL. <span class=highlightBrs>CONSUMIDOR</span>.<br>RECURSO PROVIDO.
+            </div>
+          </div>
+        </div>
+        <div class="row itemlistadocumentos p-2">
+          <div class="col-sm-1"><h4>2</h4></div>
+          <div class="col-sm-3">
+            <h4>Processo</h4>
+            <div>
+              <a href="/SCON/jurisprudencia/doc.jsp?ementa=CONSUMIDOR&i=2">REsp&nbsp;1903920</a>
+            </div>
+            <div class="small">(ACORDAO)</div>
+            <div>Ministra NANCY ANDRIGHI</div>
+            <div>DJe 01/04/2022</div>
+            <div>Decisao: 22/03/2022</div>
+          </div>
+          <div class="col-sm-8">
+            <h4>Ementa</h4>
+            <div class="clsEmentaCompleta">
+              CONSUMIDOR. RESPONSABILIDADE OBJETIVA.<br>SUMULA 297/STJ.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    </body></html>
+    """
+)
+
+
+class TestStjModernTemplateParser:
+    """SCON refreshed its results page in 2025-2026. Each acordao is now
+    inside ``<div class="row itemlistadocumentos">`` and the full ementa
+    lives in ``<div class="clsEmentaCompleta">``. The parser must extract
+    each block, build the metadata header, and use the doc.jsp href as
+    full_text_url."""
+
+    def test_parses_two_results_from_modern_template(self) -> None:
+        results = StjLegalPrecedent._parse_ementas(_STJ_MODERN_FIXTURE)
+        assert len(results) == 2
+
+        first, second = results
+
+        # First acordao
+        assert "REsp 1896379" in first.summary
+        assert "Ministro OG FERNANDES" in first.summary
+        assert "DJe 13/12/2021" in first.summary
+        assert "INCIDENTE DE ASSUNCAO DE COMPETENCIA" in first.summary
+        # Ementa text (highlight span unwrapped, comment stripped, <br> -> \n)
+        assert "PROCESSUAL CIVIL. RECURSO ESPECIAL. CONSUMIDOR" in first.summary
+        assert "Campo TEMA" not in first.summary  # comment removed
+        assert "highlightBrs" not in first.summary  # span unwrapped
+        # full_text_url uses doc.jsp absolute URL
+        assert first.full_text_url is not None
+        assert first.full_text_url.startswith(f"{_STJ_BASE}/SCON/jurisprudencia/doc.jsp")
+
+        # Second acordao (no indicador, no resumo block — only complete ementa)
+        assert "REsp 1903920" in second.summary
+        assert "Ministra NANCY ANDRIGHI" in second.summary
+        assert "SUMULA 297/STJ" in second.summary
+        assert second.full_text_url is not None
+
+    def test_metadata_header_uses_brackets(self) -> None:
+        """Metadata is prepended as ``[Processo: ... | Relator(a): ...]\\n``"""
+        results = StjLegalPrecedent._parse_ementas(_STJ_MODERN_FIXTURE)
+        assert results[0].summary.startswith("[Processo: REsp 1896379")
+        assert "| Classe: ACORDAO" in results[0].summary
+
+    def test_modern_template_takes_precedence_over_legacy(self) -> None:
+        """When both templates' markers coexist (unlikely), modern wins."""
+        hybrid = (
+            '<html><body>'
+            '<a name="DOC1"></a>'
+            '<div class="documento">'
+            '<textarea id="textSemformatacao1">Ementa legada</textarea>'
+            '</div>'
+            + _STJ_MODERN_FIXTURE
+            + '</body></html>'
+        )
+        results = StjLegalPrecedent._parse_ementas(hybrid)
+        # 2 results from modern; legacy block ignored
+        assert len(results) == 2
+        assert all("Ementa legada" not in r.summary for r in results)
+
+    def test_falls_back_to_resumo_when_no_complete_ementa(self) -> None:
+        html = textwrap.dedent(
+            """\
+            <html><body>
+            <div class="row itemlistadocumentos p-2">
+              <div class="col-sm-3">
+                <h4>Processo</h4>
+                <div><a href="/SCON/jurisprudencia/doc.jsp?i=99">REsp 999</a></div>
+                <div class="small">(ACORDAO)</div>
+                <div>Ministro X</div>
+                <div>DJe 01/01/2024</div>
+              </div>
+              <div class="col-sm-8">
+                <h4>Ementa</h4>
+                <div class="clsResumoEmenta">Resumo do acordao apenas.</div>
+              </div>
+            </div>
+            </body></html>
+            """
+        )
+        results = StjLegalPrecedent._parse_ementas(html)
+        assert len(results) == 1
+        assert "Resumo do acordao apenas" in results[0].summary
+
+    def test_html_inline_cleaning_decodes_entities(self) -> None:
+        html = (
+            '<div class="row itemlistadocumentos p-2">'
+            '<div class="col-sm-3"><h4>Processo</h4>'
+            '<div><a href="/SCON/x">REsp&nbsp;1</a></div>'
+            '<div class="small">(ACORDAO)</div></div>'
+            '<div class="col-sm-8">'
+            '<div class="clsEmentaCompleta">'
+            'TESTE &amp; ENTIDADE &quot;ASPAS&quot; &nbsp;NBSP.'
+            '</div>'
+            '</div></div>'
+        )
+        results = StjLegalPrecedent._parse_ementas(html)
+        assert len(results) == 1
+        assert "TESTE & ENTIDADE" in results[0].summary
+        assert '"ASPAS"' in results[0].summary
+        assert "&amp;" not in results[0].summary
+        assert "&nbsp;" not in results[0].summary
+
+
+# ---------------------------------------------------------------------------
 # Pydantic model — new fields are optional and serialise correctly
 # ---------------------------------------------------------------------------
 
