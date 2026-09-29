@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from jurismcp.presentation.mcp import (
     BnpLegalPrecedentsRequest,
     StjLegalPrecedentsRequest,
+    Trf4LegalPrecedentsRequest,
 )
 
 
@@ -48,6 +49,15 @@ async def test_listed_tools() -> None:
             BnpLegalPrecedentsRequest.__name__,
             {"summary": "fraude execução", "tribunal": "STJ", "especie": "SUM"},
             id="bnp_extra_fields_passthrough",
+        ),
+        pytest.param(
+            Trf4LegalPrecedentsRequest.__name__,
+            {
+                "summary": "isenção imposto renda neoplasia maligna",
+                "campo": "inteiro_teor",
+                "origens": ["TRU4"],
+            },
+            id="trf4_extra_fields_passthrough",
         ),
     ],
 )

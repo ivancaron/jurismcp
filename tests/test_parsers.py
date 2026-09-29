@@ -8,14 +8,26 @@ in `test_domain.py` and may flap depending on each court's portal status.
 
 from __future__ import annotations
 
+import logging
 import textwrap
+from pathlib import Path
+from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 
 from jurismcp.domain.bnp import (
     BnpLegalPrecedent,
     _normalize_tribunal,
     _resolve_enunciado,
+)
+from jurismcp.domain.eproc import (
+    _build_form_body,
+    _decode,
+    _html_to_text,
+    _latin1_query,
+    _mentions_process,
+    _verified_full_text,
 )
 from jurismcp.domain.jurisprudencias_ai import (
     JurisprudenciasAiLegalPrecedent,
@@ -29,6 +41,11 @@ from jurismcp.domain.tjes import (
     _build_and_query,
     _detect_winning_dissent,
 )
+from jurismcp.domain.tnu import TnuLegalPrecedent
+from jurismcp.domain.trf4 import Trf4LegalPrecedent
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # TJES — `_build_and_query` (AND semantics fix)
@@ -816,3 +833,385 @@ class TestBnpParseResults:
     def test_returns_empty_when_no_results(self) -> None:
         assert BnpLegalPrecedent._parse_results({"resultados": []}) == []
         assert BnpLegalPrecedent._parse_results({}) == []
+
+
+# ---------------------------------------------------------------------------
+# eproc (TNU / TRF4) — helpers, `_parse_results` and an offline `research`
+# ---------------------------------------------------------------------------
+
+# HTML recorded live on 29/09/2026 (see the provenance comment at the top of
+# each file): the portals' own ISO-8859-1 bytes, trimmed to the result markup.
+# trf4_resultados.html assembles real blocks from three queries (TRF4 with and
+# without dissent, a grouped block, a TRU4 monocratic decision and a Turma
+# Recursal acórdão without ementa); the inteiro teor belongs to the latter.
+_EPROC_FIXTURES = Path(__file__).parent / "fixtures" / "eproc"
+_TR_BLOCK_ID = "711790602642897167748316682208"
+_TR_PROCESSO = "5000152-42.2023.4.04.7102"
+
+
+def _eproc_fixture(name: str) -> bytes:
+    return (_EPROC_FIXTURES / name).read_bytes()
+
+
+def _tnu_results() -> list[TnuLegalPrecedent]:
+    return TnuLegalPrecedent._parse_results(
+        _decode(_eproc_fixture("tnu_resultados.html"))
+    )
+
+
+def _trf4_results() -> list[Trf4LegalPrecedent]:
+    return Trf4LegalPrecedent._parse_results(
+        _decode(_eproc_fixture("trf4_resultados.html"))
+    )
+
+
+class TestEprocHelpers:
+    """Encoding, whitespace-only normalization and process matching."""
+
+    def test_decode_prefers_cp1252_over_latin1(self) -> None:
+        # 0x93/0x94 are curly quotes in cp1252 but C1 controls in latin-1.
+        assert _decode(b"sa\xfade \x93grave\x94") == "saúde “grave”"
+
+    def test_decode_accepts_utf8_and_falls_back_to_latin1(self) -> None:
+        assert _decode("isenção".encode()) == "isenção"
+        # 0x81 is undefined in cp1252 and invalid UTF-8: latin-1 closes the chain.
+        assert _decode(b"\x81\xe7") == "\x81ç"
+
+    def test_highlight_is_unwrapped_without_space_before_punctuation(self) -> None:
+        # Recorded markup: no space between </B> and the period. Swapping tags
+        # for a space would produce the "RENDA ." artifact.
+        fragment = (
+            'IMPOSTO DE <B><FONT STYLE="background-color:#FFFF00">RENDA</FONT></B>. '
+            '<B><FONT STYLE="background-color:#FFFF00">ISENÇÃO</FONT></B>, sim'
+        )
+        assert _html_to_text(fragment) == "IMPOSTO DE RENDA. ISENÇÃO, sim"
+
+    def test_only_whitespace_is_normalized(self) -> None:
+        raw = "  a\xa0\xa0b\r\n   c \t d\n\n\n\ne  aposentação.O acórdão  "
+        # Runs of spaces collapse, line breaks survive (3+ -> 2), and the
+        # court's own "aposentação.O" is NOT "fixed": words are never touched.
+        assert _html_to_text(raw) == "a b\nc d\n\ne aposentação.O acórdão"
+
+    def test_latin1_query_folds_what_the_form_cannot_carry(self) -> None:
+        assert _latin1_query("isenção  imposto") == "isenção imposto"
+        # Curly quotes keep working as the exact-phrase operator.
+        assert (
+            _latin1_query("“moléstia grave” \u2013 isenção") == '"moléstia grave" - isenção'
+        )
+        assert _latin1_query("ẽ fim 😀") == "e fim"
+
+    def test_form_body_is_iso_8859_1_with_repeated_origins(self) -> None:
+        body = _build_form_body("isenção imposto", "E", ["3", "2"], 2).decode()
+        assert body.startswith("txtPesquisa=isen%E7%E3o%20imposto&rdoCampo=E&")
+        assert "selOrigem%5B%5D=3&selOrigem%5B%5D=2" in body
+        assert "chkAgruparResultados=on" in body
+        assert "selTamanhoPagina=10" in body
+        assert "selOrdenacao=1" in body
+        assert body.endswith("hdnPaginaAtual=2")
+
+    def test_mentions_process_in_any_usual_format(self) -> None:
+        for text in (
+            f"RECURSO CÍVEL Nº {_TR_PROCESSO}/RS",
+            'data-numero_processo="50001524220234047102"',
+            "Recurso Cível nº 5000152-42.2023.404.7102",  # legacy TRF4 style
+        ):
+            assert _mentions_process(text, _TR_PROCESSO)
+        assert not _mentions_process("5002855-38.2025.4.04.0000", _TR_PROCESSO)
+        # Digits glued to a longer number are not a match.
+        assert not _mentions_process("950001524220234047102", _TR_PROCESSO)
+
+
+class TestTnuParseResults:
+    """Recorded TNU page for "isenção imposto renda neoplasia maligna" (ementa)."""
+
+    def test_smoke_query_brings_the_puil_of_30_06_2026_first(self) -> None:
+        results = _tnu_results()
+        assert len(results) == 5
+        first = results[0].summary
+        assert first.startswith(
+            "[Processo: 0018320-54.2019.4.01.3400/TNU | "
+            "Classe: PUIL - Pedido de Uniformização de Interpretação de Lei (Turma) | "
+            "Tipo: Acórdão | UF: DF | Relator(a): NAGIBE DE MELO JORGE NETO | "
+            "Julgamento: 30/06/2026 | Publicação: 03/07/2026]\n"
+        )
+
+    def test_ementa_is_verbatim_with_highlights_unwrapped(self) -> None:
+        summary = _tnu_results()[0].summary
+        assert (
+            "PEDIDO DE UNIFORMIZAÇÃO NACIONAL. IMPOSTO DE RENDA. ISENÇÃO POR MOLÉSTIA "
+            "GRAVE (ART. 6º, XIV, DA LEI 7.713/88). NEOPLASIA MALIGNA DIAGNOSTICADA"
+        ) in summary
+        assert "RENDA ." not in summary
+        assert "<B>" not in summary
+        assert "FONT" not in summary
+
+    def test_ementa_keeps_the_quotes_the_citation_attribute_loses(self) -> None:
+        # data-citacao drops inner double quotes; the EMENTA field keeps them.
+        summary = _tnu_results()[0].summary
+        assert 'dispõe que "o contribuinte faz jus à concessão' in summary
+
+    def test_decisao_appears_once_and_official_citation_is_kept(self) -> None:
+        summary = _tnu_results()[0].summary
+        decisao = (
+            "A Turma Nacional de Uniformização decidiu, por unanimidade, conhecer e "
+            "dar provimento ao incidente de uniformização, nos termos do voto do relator."
+        )
+        assert summary.count(decisao) == 1  # rendered twice in the HTML
+        assert f"\nDecisão: {decisao}\n" in summary
+        assert summary.endswith(
+            "\nCitação: (TNU, PUIL 0018320-54.2019.4.01.3400, TURMA NACIONAL DE "
+            "UNIFORMIZAÇÃO, Relator NAGIBE DE MELO JORGE NETO, D.E. 03/07/2026)"
+        )
+
+    def test_full_text_url_is_the_blocks_own_clean_link(self) -> None:
+        first = _tnu_results()[0]
+        assert first.full_text_url == (
+            "https://eproctnu-jur.cjf.jus.br/eproc/externo_controlador.php"
+            "?acao=jurisprudencia@jurisprudencia/download_inteiro_teor"
+            "&id_jurisprudencia=771783106023514087132236866498"
+        )
+        assert first.full_text is None  # has an ementa: nothing to download
+        assert not first._needs_full_text
+        assert first.court is None  # single-court tool
+
+    def test_winning_dissent_from_relator_para_acordao(self) -> None:
+        first, second = _tnu_results()[:2]
+        assert "Relator(a) p/ acórdão: JOÃO CARLOS CABRELON DE OLIVEIRA" in second.summary
+        assert second.relator_original == "NAGIBE DE MELO JORGE NETO"
+        assert second.divergencia_vencedora is True
+        assert first.relator_original is None
+        assert first.divergencia_vencedora is False
+
+    def test_relator_para_acordao_without_defeat_is_not_a_dissent(self) -> None:
+        # A successor may sign the acórdão: without "vencido o relator" in
+        # DECISÃO the original relator is reported, but no dissent is claimed.
+        page = _decode(_eproc_fixture("tnu_resultados.html")).replace(
+            "por maioria, vencido o relator,", "por unanimidade,"
+        )
+        second = TnuLegalPrecedent._parse_results(page)[1]
+        assert second.relator_original == "NAGIBE DE MELO JORGE NETO"
+        assert second.divergencia_vencedora is False
+
+    def test_no_results_page_and_changed_template(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        empty = '<h2 class="mb-0 mr-3">0 documentos encontrados</h2>'
+        assert TnuLegalPrecedent._parse_results(empty) == []
+        assert "template may have changed" not in caplog.text
+        assert TnuLegalPrecedent._parse_results("<html>manutenção</html>") == []
+        assert "template may have changed" in caplog.text
+
+
+class TestTrf4ParseResults:
+    """Recorded TRF4 blocks: TRF4, TRU4 and Turmas Recursais in one page."""
+
+    def test_court_comes_from_the_official_citation(self) -> None:
+        # TRU4 blocks show "/TRF4" as process suffix: only the citation tells.
+        assert [r.court for r in _trf4_results()] == [
+            "TRF4", "TRF4", "TRF4", "TRU4", "Turmas Recursais",
+        ]
+
+    def test_orgao_julgador_and_feminine_labels(self) -> None:
+        first, grouped = _trf4_results()[:2]
+        assert "| Órgão julgador: 2ª Turma | UF: RS | Relator(a): RÔMULO PIZZOLATTI |" in (
+            first.summary
+        )
+        assert "Relator(a): LUCIANE A. CORRÊA MÜNCH" in grouped.summary
+
+    def test_relatora_vencida_is_a_winning_dissent(self) -> None:
+        dissent = _trf4_results()[2]
+        assert "Relator(a) p/ acórdão: RÔMULO PIZZOLATTI" in dissent.summary
+        assert dissent.relator_original == "MARIA DE FÁTIMA FREITAS LABARRÈRE"
+        assert dissent.divergencia_vencedora is True
+
+    def test_grouped_block_links_its_own_document(self) -> None:
+        grouped = _trf4_results()[1]
+        assert grouped.full_text_url is not None
+        assert grouped.full_text_url.endswith(
+            "&id_jurisprudencia=41747844027126114937284163664"
+        )
+
+    def test_link_of_another_document_is_not_trusted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The grouping trap: a block whose inteiro-teor link points elsewhere.
+        page = _decode(_eproc_fixture("trf4_resultados.html")).replace(
+            "download_inteiro_teor&id_jurisprudencia=41790353874086228384249255675",
+            "download_inteiro_teor&id_jurisprudencia=99999999999999999999999999999",
+        )
+        first = Trf4LegalPrecedent._parse_results(page)[0]
+        assert first.full_text_url is not None
+        assert first.full_text_url.endswith(
+            "&id_jurisprudencia=41790353874086228384249255675"
+        )
+        assert "99999999999999999999999999999" in caplog.text
+
+    def test_monocratic_decision_text_comes_in_decisao(self) -> None:
+        mono = _trf4_results()[3]
+        assert "Tipo: Decisão monocrática" in mono.summary
+        assert "\n(Sem ementa na base do tribunal.)\nDecisão: Trata-se de pedido" in (
+            mono.summary
+        )
+        # The hidden "completo" copy is read, not the truncated "limitado" one.
+        assert "Preclusa a presente decisão, baixem-se os autos." in mono.summary
+        assert not mono._needs_full_text  # DECISÃO already is the whole decision
+
+    def test_turma_recursal_acordao_without_ementa_needs_full_text(self) -> None:
+        tr = _trf4_results()[4]
+        assert tr.summary.startswith(f"[Processo: {_TR_PROCESSO}/RS | Classe: RCIJEF")
+        assert (
+            "\n(Sem ementa na base do tribunal.)\nDecisão: A 5ª Turma Recursal do Rio "
+            "Grande do Sul decidiu, por unanimidade, negar provimento ao recurso"
+        ) in tr.summary
+        assert tr._needs_full_text
+        assert tr.full_text is None  # filled by research(), after verification
+
+
+class TestEprocFullText:
+    """Downloaded inteiro teor: verified against the block's process number."""
+
+    def test_recorded_inteiro_teor_becomes_clean_text(self) -> None:
+        document = _decode(_eproc_fixture("trf4_inteiro_teor_5000152.html"))
+        text = _verified_full_text(document, _TR_PROCESSO)
+        assert text is not None
+        assert text.startswith("Poder Judiciário\n\nJUSTIÇA FEDERAL")
+        assert f"RECURSO CÍVEL Nº {_TR_PROCESSO}/RS" in text
+        assert "dispôs que “a partir de 1º de janeiro de 1996" in text
+        assert "A 5ª TURMA RECURSAL DO RIO GRANDE DO SUL DECIDIU, POR UNANIMIDADE" in text
+        # head/style/img and every tag are gone.
+        assert "<" not in text
+        assert ".elided" not in text
+        assert "Documento:" not in text
+
+    def test_inteiro_teor_of_another_process_is_rejected(self) -> None:
+        document = _decode(_eproc_fixture("trf4_inteiro_teor_5000152.html"))
+        assert _verified_full_text(document, "5002855-38.2025.4.04.0000") is None
+        assert _verified_full_text(document, None) is None
+
+
+def _mock_eproc(
+    monkeypatch: pytest.MonkeyPatch,
+    results_page: bytes,
+    download: Callable[[str], httpx.Response],
+) -> list[httpx.Request]:
+    """Route the eproc client to recorded pages; return the requests it made."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        action = str(request.url.params.get("acao", ""))
+        if action.endswith("/pesquisar"):
+            return httpx.Response(200, content=b"<html>formulario</html>")
+        if action.endswith("/listar_resultados"):
+            return httpx.Response(200, content=results_page)
+        if action.endswith("/download_inteiro_teor"):
+            return download(str(request.url.params.get("id_jurisprudencia", "")))
+        return httpx.Response(404)
+
+    real_client = httpx.AsyncClient
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)  # pyright: ignore[reportArgumentType]
+
+    # eproc resolves httpx.AsyncClient at call time, so patching the module
+    # attribute reroutes its client (restored by monkeypatch after the test).
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    return requests
+
+
+def _serve_tr_inteiro_teor(doc_id: str) -> httpx.Response:
+    if doc_id == _TR_BLOCK_ID:
+        return httpx.Response(200, content=_eproc_fixture("trf4_inteiro_teor_5000152.html"))
+    return httpx.Response(404)
+
+
+class TestEprocResearchOffline:
+    """End-to-end ``research`` against recorded pages (no network)."""
+
+    async def test_flow_body_and_selective_download(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        requests = _mock_eproc(
+            monkeypatch, _eproc_fixture("trf4_resultados.html"), _serve_tr_inteiro_teor
+        )
+        results = await Trf4LegalPrecedent.research(
+            None,  # pyright: ignore[reportArgumentType] — browser not used
+            summary_search_prompt="isenção imposto renda neoplasia maligna",
+            desired_page=2,
+            campo="inteiro_teor",
+            origens=["TR", "TRU4"],
+        )
+
+        # GET form (session) -> POST results -> ONE download: only the Turma
+        # Recursal acórdão lacks an ementa (the monocratic decision has DECISÃO).
+        assert [r.method for r in requests] == ["GET", "POST", "GET"]
+        assert requests[2].url.params["id_jurisprudencia"] == _TR_BLOCK_ID
+        body = requests[1].content.decode()
+        assert "txtPesquisa=isen%E7%E3o%20imposto%20renda%20neoplasia%20maligna" in body
+        assert "rdoCampo=I" in body
+        assert "selOrigem%5B%5D=3&selOrigem%5B%5D=2" in body
+        assert "hdnPaginaAtual=2" in body
+
+        assert len(results) == 5
+        tr = results[4]
+        assert tr.full_text is not None
+        assert f"RECURSO CÍVEL Nº {_TR_PROCESSO}/RS" in tr.full_text
+        assert all(r.full_text is None for r in results[:4])
+
+    async def test_inteiro_teor_of_another_process_is_discarded(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Same download, but the block now claims another process number.
+        page = _eproc_fixture("trf4_resultados.html").replace(
+            f"{_TR_PROCESSO}/RS".encode(), b"5009999-11.2023.4.04.7102/RS"
+        )
+        _mock_eproc(monkeypatch, page, _serve_tr_inteiro_teor)
+        results = await Trf4LegalPrecedent.research(
+            None,  # pyright: ignore[reportArgumentType] — browser not used
+            summary_search_prompt="neoplasia maligna",
+            campo="inteiro_teor",
+        )
+        assert results[4].full_text is None
+        assert results[4].full_text_url is not None  # the link itself stays
+        assert "does not mention process 5009999-11.2023.4.04.7102" in caplog.text
+
+    async def test_download_failure_keeps_the_results(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _mock_eproc(
+            monkeypatch,
+            _eproc_fixture("trf4_resultados.html"),
+            lambda _doc_id: httpx.Response(503),
+        )
+        caplog.set_level(logging.WARNING)
+        results = await Trf4LegalPrecedent.research(
+            None,  # pyright: ignore[reportArgumentType] — browser not used
+            summary_search_prompt="neoplasia maligna",
+            campo="inteiro_teor",
+        )
+        assert len(results) == 5
+        assert results[4].full_text is None
+        assert "unavailable" in caplog.text
+
+    async def test_invalid_arguments_fail_fast_without_requests(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        requests = _mock_eproc(monkeypatch, b"", _serve_tr_inteiro_teor)
+        with pytest.raises(RuntimeError, match="origem 'TRF5' desconhecida"):
+            await Trf4LegalPrecedent.research(
+                None,  # pyright: ignore[reportArgumentType] — browser not used
+                summary_search_prompt="neoplasia",
+                origens=["TRF5"],
+            )
+        with pytest.raises(RuntimeError, match="campo 'acordao' inválido"):
+            await TnuLegalPrecedent.research(
+                None,  # pyright: ignore[reportArgumentType] — browser not used
+                summary_search_prompt="neoplasia",
+                campo="acordao",
+            )
+        with pytest.raises(RuntimeError, match="informe os termos de busca"):
+            await TnuLegalPrecedent.research(
+                None,  # pyright: ignore[reportArgumentType] — browser not used
+                summary_search_prompt=" \U0001f600 ",
+            )
+        assert requests == []

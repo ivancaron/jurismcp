@@ -29,6 +29,8 @@ Each court uses the most reliable access method available:
 | **LexML** (federated) | Direct HTTP GET (HTML scrape) | `lexml.gov.br/busca/search` |
 | **Jurisprudencias.ai** (opt-in, multi-court) | Direct HTTP GET (JSON REST API, token) | `jurisprudencias.ai/api/v1/courts/{court}/decisions` |
 | **BNP/CNJ** (qualified precedents, 60+ courts) | Direct HTTP POST (JSON REST API) | `pangeabnp.pdpj.jus.br/api/v1/precedentes` |
+| **TNU** | Direct HTTP POST (eproc HTML form) | `eproctnu-jur.cjf.jus.br/eproc/externo_controlador.php` |
+| **TRF4** (TRF4, TRU4 and the 4th Region's Turmas Recursais) | Direct HTTP POST (eproc HTML form) | `jurisprudencia.trf4.jus.br/eproc2trf4/externo_controlador.php` |
 
 The STJ endpoint (`processo.stj.jus.br`) serves the same SCON search results as
 `scon.stj.jus.br` but without Cloudflare Turnstile protection, enabling fast and
@@ -62,6 +64,19 @@ each precedent's FIXED THESIS and live status (Vigente/Afetado/Cancelado/...),
 not case-law ementas or full texts. The backing REST API is public and
 unauthenticated, but undocumented — the contract was lifted by portal
 inspection (aug/2026).
+
+**TNU** and **TRF4** run the same case-law module of eproc (the electronic
+case system built by the TRF4), so one engine (`domain/eproc.py`) serves both.
+The search is a server-rendered HTML form (session GET + ISO-8859-1 POST); no
+browser is needed. Each result carries the verbatim ementa (search highlights
+are removed without touching the text), the judgment outcome, the portal's
+official citation and a session-free link to the inteiro teor. The TRF4 base
+also federates the TRU4 and the 4th Region's Turmas Recursais, told apart by
+`court`. Turma Recursal acórdãos almost never have an ementa: they only
+surface when searching the inteiro teor, and their full text is downloaded into
+`full_text` after checking that it mentions the result's own process number
+(the portal groups identical ementas, and a result's link may belong to another
+process). The old TNU base (decisions up to jun/2017) is not covered.
 
 A new design switch, `BaseLegalPrecedent.requires_browser`, lets the dispatcher
 pick HTTP vs. browser automatically per court, so adding a new HTTP-based court
@@ -135,6 +150,15 @@ uv run patchright install
   `RR`, `RG`, `IRDR`), `numero` (exact Tema/Súmula number) and `incluir_cancelados`. Returns the
   fixed thesis (and the submitted question when distinct), **not** ementas or full texts — use the
   dedicated court tools or LexML for those. Public unauthenticated REST API; no browser.
+- `TnuLegalPrecedentsRequest`: Research the case law of the National Uniformization Panel of the
+  Federal Small Claims Courts (TNU) in its eproc base. Optional `campo`: `ementa` (default) or
+  `inteiro_teor`. Returns the verbatim ementa, the judgment outcome, the official citation and the
+  inteiro-teor link; 10 results per page, newest first. Direct HTTP (no browser).
+- `Trf4LegalPrecedentsRequest`: Research the case law of the Federal Regional Court of the 4th
+  Region (TRF4), its Regional Uniformization Panel (TRU4) and the Turmas Recursais of RS, SC and PR.
+  Optional `campo` (`ementa`/`inteiro_teor`) and `origens` (any of `TRF4`, `TRU4`, `TR`; default
+  all three). `court` tells the origin of each result; Turma Recursal acórdãos (no ementa) come
+  with the downloaded inteiro teor in `full_text`. Direct HTTP (no browser).
 
 ### Response Fields
 
@@ -144,11 +168,11 @@ results may also expose the following optional fields when the source court prov
 | Field | Type | Populated by | Description |
 |-------|------|--------------|-------------|
 | `summary` | `str` | All | The ementa (mandatory). |
-| `full_text` | `str \| None` | TJES | Integral text of the decision (relatório + voto + dispositivo). The TJES REST API ships this on the same response as the summary, so no extra request is needed. |
-| `full_text_url` | `str \| None` | STJ, STF, TST | Absolute URL pointing to the inteiro teor. STJ returns a PDF directly (`/SCON/GetInteiroTeorDoAcordao?...`); STF returns a details page that hosts the PDF; TST returns the closest matching link found within each result block. |
-| `relator_original` | `str \| None` | TJES | Original rapporteur's name when the decision was rendered by a winning dissent — situation in which the TJES API indexes the case by the redator (winning vote) instead of the original relator. |
-| `divergencia_vencedora` | `bool` | TJES | `True` when the decision was rendered by a winning dissent. Defaults to `False`. |
-| `court` | `str \| None` | LexML, BNP | Originating court/organ of a federated result, since these sources aggregate many courts in one response. |
+| `full_text` | `str \| None` | TJES, TNU, TRF4 | Integral text of the decision (relatório + voto + dispositivo). The TJES REST API ships this on the same response as the summary, so no extra request is needed. TNU/TRF4 download it only for acórdãos without an ementa (typically the Turmas Recursais), and only keep it when it mentions the result's own process number. |
+| `full_text_url` | `str \| None` | STJ, STF, TST, TNU, TRF4 | Absolute URL pointing to the inteiro teor. STJ returns a PDF directly (`/SCON/GetInteiroTeorDoAcordao?...`); STF returns a details page that hosts the PDF; TST returns the closest matching link found within each result block; TNU/TRF4 link the portal's HTML download, which opens without a session. |
+| `relator_original` | `str \| None` | TJES, TNU, TRF4 | Original rapporteur's name when the decision was rendered by a winning dissent — situation in which the TJES API indexes the case by the redator (winning vote) instead of the original relator. TNU/TRF4 fill it with the RELATOR when a distinct RELATOR PARA ACÓRDÃO signed the decision. |
+| `divergencia_vencedora` | `bool` | TJES, TNU, TRF4 | `True` when the decision was rendered by a winning dissent (TNU/TRF4: the DECISÃO states the relator was defeated). Defaults to `False`. |
+| `court` | `str \| None` | LexML, BNP, TRF4 | Originating court/organ of a federated result, since these sources aggregate many courts in one response. TRF4 results carry `TRF4`, `TRU4` or `Turmas Recursais`. |
 | `urn` | `str \| None` | LexML | The `urn:lex:br:...` identifier of the document; pairs with `full_text_url` (the URN resolver link). |
 
 All optional fields default to `None`/`False` when the court doesn't expose the data, so the change
@@ -158,7 +182,9 @@ is fully backwards compatible — existing consumers that don't read them keep w
 
 Each court supports specific search operators for more precise queries. See the tool descriptions
 for detailed syntax (e.g., `e`, `ou`, `não`, `adj`, `prox`, `$`, `?` for STJ; `E`, `OU`, `NÃO`,
-`"..."`, `"..."~N`, `$`, `?` for STF). For TJES, terms are combined with implicit `AND`.
+`"..."`, `"..."~N`, `$`, `?` for STF). For TJES, terms are combined with implicit `AND`. TNU and
+TRF4 also combine terms with implicit `AND` and accept `"..."`, `e`, `ou`, `não`, `prox` and
+`"prefix*"`.
 
 ## Development
 

@@ -4,7 +4,7 @@ MCP de Pesquisa Jurisprudencial. Scraping direto nos sites oficiais.
 
 ## O que é
 
-Servidor MCP que pesquisa jurisprudência em 7 fontes e devolve metadados + ementa + link:
+Servidor MCP que pesquisa jurisprudência em 9 fontes e devolve metadados + ementa + link:
 
 - **STJ** — HTTP POST direto ao SCON (sem browser)
 - **STF** e **TST** — browser headless via patchright/Chromium
@@ -14,16 +14,19 @@ Servidor MCP que pesquisa jurisprudência em 7 fontes e devolve metadados + emen
 
 - **BNP/CNJ** — API REST pública SEM autenticação, **precedentes QUALIFICADOS de 60+ tribunais** (súmulas, SV, temas RG/RR, IRDR, IAC, IRR, PUIL, OJ, ADI/ADC/ADO/ADPF de STF/STJ/TST/STM/TNU/27 TJs/6 TRFs/24 TRTs), cada um com a situação viva. Devolve a TESE fixada, não ementa/inteiro teor. Request: `BnpLegalPrecedentsRequest` (`summary` + opcionais `tribunal`, `especie`, `numero`, `incluir_cancelados`). Endpoint `pangeabnp.pdpj.jus.br/api/v1/precedentes` (POST). Quirks: API não documentada (contrato por inspeção 08/2026); `orgaos`/`tipos` vazios → 400 opaco (listas sempre explícitas; órgãos via `GET /parametros` com cache de processo + fallback hardcoded); em SUM/SV o enunciado vem no campo `questao` (promoção só nessas espécies); teses-placebo ("não informado") viram "(ainda não publicada no BNP)" mas o item é MANTIDO; `situacao` é vocabulário aberto, exibida verbatim; portal SPA sem deep link por precedente.
 
+- **TNU** e **TRF4** (inclui TRU4 e Turmas Recursais do RS/SC/PR) — módulo de jurisprudência do **eproc**, HTTP puro (NÃO exige browser; medido em 29/09/2026). Um motor só (`eproc.py`, `EprocLegalPrecedent`) e duas subclasses finas (`tnu.py`, `trf4.py`) que definem `portal_url`, `source` e `origin_codes` (`selOrigem[]`: TNU 1=TNU; TRF4 1=TRF4, 2=TRU4, 3=TR, 4=Varas — Varas fora do escopo). Fluxo: GET `externo_controlador.php?acao=jurisprudencia@jurisprudencia/pesquisar` (sessão) + POST `.../listar_resultados` com corpo em ISO-8859-1; paginação por `hdnPaginaAtual`, 10 por página, mais recentes primeiro. Requests: `TnuLegalPrecedentsRequest` (`summary` + `campo` ementa/inteiro_teor) e `Trf4LegalPrecedentsRequest` (+ `origens`). Quirks: destaque `<B><FONT>` sai com string vazia (nunca espaço: evita "RENDA ."); DECISÃO vem duplicada (lê-se a cópia `completo`); `data-citacao` perde aspas internas (só a referência final é usada, e o 1º item dela vira `court` no TRF4 — o sufixo `/TRF4` não distingue a TRU4); inteiro teor (`download_inteiro_teor`, abre sem sessão; decodificação utf-8 → cp1252 → latin-1) só é baixado para ACÓRDÃO sem ementa (Turmas Recursais) e só é exposto se citar o número do próprio processo (armadilha do agrupamento de ementas idênticas); monocráticas trazem o texto integral em DECISÃO. A base antiga da TNU (até jun/2017, JSF) fica fora.
+
 ## Arquitetura
 
-- `src/jurismcp/domain/` — `stf.py`, `stj.py`, `tst.py`, `tjes.py`, `lexml.py`, `jurisprudencias_ai.py`, `bnp.py`
+- `src/jurismcp/domain/` — `stf.py`, `stj.py`, `tst.py`, `tjes.py`, `lexml.py`, `jurisprudencias_ai.py`, `bnp.py`, `eproc.py` (motor compartilhado), `tnu.py`, `trf4.py`
 - `src/jurismcp/presentation/mcp.py` — entry point
 - O switch `BaseLegalPrecedent.requires_browser` decide HTTP vs browser por fonte.
-- Tools de tribunal único carregam só `summary`+`page`; tools multi-tribunal (Jurisprudencias.ai, BNP) carregam campos extras (`court`; `tribunal`/`especie`/`numero`/`incluir_cancelados`) que o dispatcher repassa via `**extra` a `research()` — fontes de tribunal único não são afetadas (recebem `**{}`).
+- Tools de tribunal único carregam só `summary`+`page`; tools multi-tribunal (Jurisprudencias.ai, BNP) carregam campos extras (`court`; `tribunal`/`especie`/`numero`/`incluir_cancelados`) que o dispatcher repassa via `**extra` a `research()` — fontes de tribunal único não são afetadas (recebem `**{}`). As tools do eproc também usam esse repasse (`campo`; `origens` no TRF4).
+- `tests/fixtures/` guarda respostas HTTP GRAVADAS (bytes originais, ISO-8859-1, CRLF/LF misturados) para os testes offline; o `.gitattributes` as marca `-text` para o Git não converter fim de linha.
 
 ## Adding a new source
 
-Passo-a-passo (o exemplar mais recente é o `bnp.py`; para fonte autenticada/opt-in, o `jurisprudencias_ai.py`):
+Passo-a-passo (o exemplar mais recente é o `bnp.py`; para fonte autenticada/opt-in, o `jurisprudencias_ai.py`; para outro tribunal com o módulo de jurisprudência do eproc, basta uma subclasse de `EprocLegalPrecedent` com `portal_url`/`source`/`origin_codes`, como `tnu.py`):
 
 1. **`src/jurismcp/domain/<fonte>.py`** — `class <Fonte>LegalPrecedent(BaseLegalPrecedent)`:
    - `requires_browser: ClassVar[bool] = False` para HTTP/JSON/HTML direto (só STF/TST usam browser);

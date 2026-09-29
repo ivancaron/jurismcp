@@ -1,0 +1,3 @@
+# Recorded HTTP responses used by the offline parser tests: keep them
+# byte-for-byte (ISO-8859-1 with the courts' own mixed CRLF/LF line endings).
+tests/fixtures/** -text
