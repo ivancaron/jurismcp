@@ -22,6 +22,8 @@ Cada tribunal utiliza o método de acesso mais confiável disponível:
 | **STF** | Browser headless (Chromium) | `portal.stf.jus.br` |
 | **TST** | Browser headless (Chromium) | `jurisprudencia.tst.jus.br` |
 | **BNP/CNJ** (precedentes qualificados, 60+ tribunais) | HTTP POST direto (API REST JSON) | `pangeabnp.pdpj.jus.br/api/v1/precedentes` |
+| **TNU** | HTTP POST direto (formulário HTML do eproc) | `eproctnu-jur.cjf.jus.br/eproc/externo_controlador.php` |
+| **TRF4** (TRF4, TRU4 e Turmas Recursais da 4ª Região) | HTTP POST direto (formulário HTML do eproc) | `jurisprudencia.trf4.jus.br/eproc2trf4/externo_controlador.php` |
 
 O endpoint do STJ (`processo.stj.jus.br`) serve os mesmos resultados de pesquisa SCON que o
 `scon.stj.jus.br`, porém sem proteção Cloudflare Turnstile, permitindo acesso rápido e confiável
@@ -76,12 +78,22 @@ uv run patchright install
   situação viva (Vigente/Afetado/Cancelado/...). Filtros opcionais: `tribunal`, `especie`,
   `numero` e `incluir_cancelados`. Devolve a TESE fixada (e a questão submetida, quando
   distinta), não ementas nem inteiros teores. API pública sem autenticação; sem browser.
+- `TnuLegalPrecedentsRequest`: Pesquisa a jurisprudência da Turma Nacional de Uniformização dos
+  Juizados Especiais Federais (TNU) na base do eproc. Campo opcional `campo`: `ementa` (padrão) ou
+  `inteiro_teor`. Devolve a ementa sem alteração, a decisão, a citação oficial e o link do inteiro
+  teor; 10 resultados por página, do mais recente para o mais antigo. HTTP direto; sem browser.
+- `Trf4LegalPrecedentsRequest`: Pesquisa a jurisprudência do TRF4, da Turma Regional de
+  Uniformização (TRU4) e das Turmas Recursais do RS, de SC e do PR. Campos opcionais `campo`
+  (`ementa`/`inteiro_teor`) e `origens` (`TRF4`, `TRU4`, `TR`; padrão: as três). O campo `court`
+  indica a origem de cada resultado; acórdãos de Turma Recursal (sem ementa) vêm com o inteiro teor
+  baixado em `full_text`, conferido pelo número do processo. HTTP direto; sem browser.
 
 ### Operadores de Busca
 
 Cada tribunal suporta operadores de busca específicos para consultas mais precisas. Consulte as
 descrições das ferramentas para a sintaxe detalhada (ex.: `e`, `ou`, `não`, `adj`, `prox`, `$`,
-`?` para STJ; `E`, `OU`, `NÃO`, `"..."`, `"..."~N`, `$`, `?` para STF).
+`?` para STJ; `E`, `OU`, `NÃO`, `"..."`, `"..."~N`, `$`, `?` para STF; `"..."`, `e`, `ou`, `não`,
+`prox` e `"prefixo*"` para TNU e TRF4, com E implícito entre os termos).
 
 ## Desenvolvimento
 
