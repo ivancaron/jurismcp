@@ -135,6 +135,33 @@ def _clean_html_inline(fragment: str) -> str:
     return text.strip()
 
 
+def _build_metadata_header(block: str, processo: str | None) -> str:
+    """Build the ``[Processo | Classe | Relator(a) | Decisao | DJe | Indicador]``
+    header that prefixes the ementa ("" when the block carries none of them)."""
+    classe_m = _CLASSE_RE.search(block)
+    relator_m = _RELATOR_RE.search(block)
+    dje_m = _DJE_RE.search(block)
+    decisao_m = _DECISAO_RE.search(block)
+    indicador_m = _INDICADORES_RE.search(block)
+
+    metadata_parts: list[str] = []
+    if processo:
+        cabec = f"Processo: {processo}"
+        if classe_m:
+            cabec += f" | Classe: {classe_m.group(1).strip()}"
+        metadata_parts.append(cabec)
+    if relator_m:
+        metadata_parts.append(f"Relator(a): {relator_m.group(1).strip()}")
+    if decisao_m:
+        metadata_parts.append(decisao_m.group(1).strip())
+    if dje_m:
+        metadata_parts.append(dje_m.group(1).strip())
+    if indicador_m:
+        metadata_parts.append(f"Indicador: {indicador_m.group(1).strip()}")
+
+    return "[" + " | ".join(metadata_parts) + "]\n" if metadata_parts else ""
+
+
 class StjLegalPrecedent(BaseLegalPrecedent):
     """Model for a legal precedent from the Superior Tribunal de Justica (STJ)."""
 
@@ -261,37 +288,13 @@ class StjLegalPrecedent(BaseLegalPrecedent):
             if not ementa_text:
                 continue
 
-            # Metadata header
-            metadata_parts: list[str] = []
+            # Metadata header (the processo anchor also carries the doc.jsp href)
             proc_m = _PROCESSO_RE.search(block)
             href = proc_m.group(1) if proc_m else None
             processo = (
                 _clean_html_inline(proc_m.group(2)) if proc_m else None
             )
-            classe_m = _CLASSE_RE.search(block)
-            relator_m = _RELATOR_RE.search(block)
-            dje_m = _DJE_RE.search(block)
-            decisao_m = _DECISAO_RE.search(block)
-            indicador_m = _INDICADORES_RE.search(block)
-
-            if processo:
-                cabec = f"Processo: {processo}"
-                if classe_m:
-                    cabec += f" | Classe: {classe_m.group(1).strip()}"
-                metadata_parts.append(cabec)
-            if relator_m:
-                metadata_parts.append(f"Relator(a): {relator_m.group(1).strip()}")
-            if decisao_m:
-                metadata_parts.append(decisao_m.group(1).strip())
-            if dje_m:
-                metadata_parts.append(dje_m.group(1).strip())
-            if indicador_m:
-                metadata_parts.append(f"Indicador: {indicador_m.group(1).strip()}")
-
-            header = (
-                "[" + " | ".join(metadata_parts) + "]\n" if metadata_parts else ""
-            )
-            summary = header + ementa_text
+            summary = _build_metadata_header(block, processo) + ementa_text
 
             # full_text_url — uses the doc.jsp href, made absolute
             full_text_url: str | None = None
