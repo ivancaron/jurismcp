@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import textwrap
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -15,6 +15,8 @@ from jurismcp.domain.lexml import LexmlLegalPrecedent
 from jurismcp.domain.stf import StfLegalPrecedent
 from jurismcp.domain.stj import StjLegalPrecedent
 from jurismcp.domain.tjes import TjesLegalPrecedent
+from jurismcp.domain.tnu import TnuLegalPrecedent
+from jurismcp.domain.trf4 import Trf4LegalPrecedent
 from jurismcp.domain.tst import TstLegalPrecedent
 from jurismcp.utils import browser_factory
 
@@ -578,6 +580,111 @@ class BnpLegalPrecedentsRequest(BaseLegalPrecedentsRequest):
     )
 
 
+class _EprocLegalPrecedentsRequest(BaseLegalPrecedentsRequest):
+    """Campos comuns às bases de jurisprudência do eproc (TNU e TRF4)."""
+
+    summary: str = Field(
+        title="Termos de busca",
+        description=textwrap.dedent("""
+            Termos buscados na ementa (padrão) ou no inteiro teor das decisões, conforme
+            o campo `campo`.
+
+            Os termos são combinados com E implícito: TODOS precisam aparecer na decisão.
+            Por isso, quanto MAIS termos, MENOS resultados; se vier vazio, remova termos.
+
+            Operadores aceitos pelo portal:
+            - `"expressão exata"` entre aspas duplas. Ex.: "moléstia grave"
+            - `e`: todas as palavras. Ex.: aposentadoria e especial
+            - `ou`: pelo menos uma das palavras. Ex.: drogas ou entorpecentes
+            - `não`: exclui o que vem depois. Ex.: crime não "sonegação fiscal"
+            - `prox`: palavras próximas no texto. Ex.: aposentadoria prox contribuição
+            - `"prefixo*"` entre aspas: início de palavra. Ex.: "embarg*" (embargo,
+              embargou, embargante)
+
+            DICA: comece com 2-4 termos técnicos distintivos."""),
+        min_length=1,
+        examples=[
+            "isenção imposto renda neoplasia maligna",
+            '"moléstia grave" e aposentadoria',
+            "auxílio-acidente prox redução",
+            "BPC ou LOAS",
+        ],
+    )
+
+
+class TnuLegalPrecedentsRequest(_EprocLegalPrecedentsRequest):
+    """Requisição de precedentes da Turma Nacional de Uniformização dos Juizados Especiais Federais (TNU).
+
+    A TNU, que funciona junto ao Conselho da Justiça Federal (CJF), uniformiza a interpretação de
+    lei federal em questões de direito material nos Juizados Especiais Federais: previdenciário e
+    assistencial (aposentadorias, benefícios por incapacidade, BPC/LOAS, pensão por morte),
+    tributário de pessoa física (ex.: isenção de imposto de renda por moléstia grave), FGTS e
+    servidores públicos federais, entre outros. Julga pedidos de uniformização (PUIL, antigo
+    PEDILEF) e fixa teses em representativos de controvérsia (Temas da TNU).
+
+    Pesquisa a base de jurisprudência do eproc da TNU (eproctnu-jur.cjf.jus.br). A base ANTIGA
+    (julgados até jun/2017, em jurisprudencia.cjf.jus.br/tnu) NÃO é coberta.
+
+    Cada resultado traz processo, classe, tipo de documento, relator(a) e relator(a) para o
+    acórdão, datas de julgamento e de publicação, a ementa (transcrita sem alteração), a decisão
+    (resultado do julgamento), a citação oficial sugerida pelo portal e o link do inteiro teor
+    (`full_text_url`). Ordem: do mais recente para o mais antigo, 10 por página. Decisões
+    monocráticas não têm ementa: o texto integral delas vem em "Decisão".
+
+    Para a TESE de um Tema da TNU (representativo de controvérsia), consulte também o BNP
+    (`BnpLegalPrecedentsRequest` com `tribunal`=TNU e `especie`=PUIL)."""
+
+    campo: Literal["ementa", "inteiro_teor"] = Field(
+        title="Campo pesquisado",
+        description=textwrap.dedent("""
+            Onde procurar os termos: `ementa` (padrão; mais preciso) ou `inteiro_teor`
+            (mais amplo). Decisões monocráticas não têm ementa, então só aparecem na
+            busca por `inteiro_teor`."""),
+        default="ementa",
+    )
+
+
+class Trf4LegalPrecedentsRequest(_EprocLegalPrecedentsRequest):
+    """Requisição de precedentes do TRF4, da TRU4 e das Turmas Recursais dos JEFs da 4ª Região.
+
+    O Tribunal Regional Federal da 4ª Região (TRF4) julga em 2º grau as causas da Justiça Federal
+    do Rio Grande do Sul, de Santa Catarina e do Paraná: previdenciário, tributário,
+    administrativo, penal federal, saúde, SFH, entre outros. A Turma Regional de Uniformização
+    (TRU4) uniformiza a jurisprudência entre as Turmas Recursais da região, e as Turmas Recursais
+    julgam os recursos dos Juizados Especiais Federais (JEF) do RS, de SC e do PR.
+
+    Pesquisa a base de jurisprudência do eproc do TRF4 (jurisprudencia.trf4.jus.br); escolha as
+    origens em `origens` (padrão: as três). Cada resultado traz processo, classe, tipo de
+    documento, órgão julgador, UF, relator(a) e relator(a) para o acórdão, datas, a ementa
+    (transcrita sem alteração), a decisão, a citação oficial sugerida pelo portal e o link do
+    inteiro teor (`full_text_url`); o campo `court` indica a origem (TRF4, TRU4 ou Turmas
+    Recursais). Ordem: do mais recente para o mais antigo, 10 por página.
+
+    IMPORTANTE: acórdãos das Turmas Recursais quase nunca têm ementa, então só aparecem na busca
+    por `inteiro_teor`; para eles o inteiro teor é baixado e devolvido em `full_text`. Decisões
+    monocráticas também não têm ementa, mas o texto integral delas já vem em "Decisão"."""
+
+    campo: Literal["ementa", "inteiro_teor"] = Field(
+        title="Campo pesquisado",
+        description=textwrap.dedent("""
+            Onde procurar os termos: `ementa` (padrão; mais preciso) ou `inteiro_teor`
+            (mais amplo). Use `inteiro_teor` para alcançar os acórdãos das Turmas
+            Recursais e as decisões monocráticas, que não têm ementa."""),
+        default="ementa",
+    )
+
+    origens: list[Literal["TRF4", "TRU4", "TR"]] = Field(
+        title="Origens",
+        description=textwrap.dedent("""
+            Origens pesquisadas (uma ou mais). Padrão: as três.
+            - `TRF4`: Tribunal Regional Federal da 4ª Região (órgãos julgadores do tribunal)
+            - `TRU4`: Turma Regional de Uniformização dos JEFs da 4ª Região
+            - `TR`: Turmas Recursais dos JEFs do RS, de SC e do PR"""),
+        default=["TRF4", "TRU4", "TR"],
+        min_length=1,
+    )
+
+
 _TOOLS_AND_MODELS: Final[
     list[
         tuple[
@@ -589,7 +696,9 @@ _TOOLS_AND_MODELS: Final[
             | type[TjesLegalPrecedentsRequest]
             | type[LexmlLegalPrecedentsRequest]
             | type[JurisprudenciasAiLegalPrecedentsRequest]
-            | type[BnpLegalPrecedentsRequest],
+            | type[BnpLegalPrecedentsRequest]
+            | type[TnuLegalPrecedentsRequest]
+            | type[Trf4LegalPrecedentsRequest],
         ]
     ]
 ] = [
@@ -610,6 +719,8 @@ _TOOLS_AND_MODELS: Final[
         (LexmlLegalPrecedentsRequest, LexmlLegalPrecedent),
         (JurisprudenciasAiLegalPrecedentsRequest, JurisprudenciasAiLegalPrecedent),
         (BnpLegalPrecedentsRequest, BnpLegalPrecedent),
+        (TnuLegalPrecedentsRequest, TnuLegalPrecedent),
+        (Trf4LegalPrecedentsRequest, Trf4LegalPrecedent),
     ]
 ]
 
