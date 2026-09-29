@@ -19,6 +19,18 @@ Important characteristics discovered while integrating (jun/2026):
 * ``robots.txt`` blocks the default ``python-requests`` user agent and sets a
   crawl-delay; we send a browser-like User-Agent and keep request volume low.
 
+Since 29/09/2026 the portal sits behind the Senado Federal's anti-bot gate. A
+plain GET now answers **HTTP 200** with a ~9 KB interstitial titled
+"Verificação de segurança — Senado Federal" ("Verificando sua conexão", plus a
+``<noscript>`` saying "JavaScript is required to use this page") whose script
+must solve a SHA-256 proof-of-work before the XTF page is served. We
+deliberately do **not** solve, bypass or automate it (no browser, no challenge
+solving). Instead ``_parse_results`` recognizes the interstitial and raises
+``RuntimeError`` with a PT-BR message, which the MCP dispatcher turns into
+``[ERRO] LEXML: ...``. Returning ``[]`` would surface as "Nenhum resultado
+encontrado", a false negative the consuming model reads as "no case law
+exists". The error is not retried: an immediate retry gets the same page.
+
 LexML jurisprudence records expose **metadata only** (localidade, autoridade,
 título = acórdão + processo number, data) plus a URN link — **not** the full
 ementa. We therefore build ``summary`` from the metadata and set
@@ -78,6 +90,20 @@ _WS_RE = re.compile(r"\s+")
 _NO_RESULTS_RE = re.compile(
     r"Nenhum\s+documento|0\s+documentos\s+encontrad", re.IGNORECASE
 )
+# Senado Federal anti-bot interstitial (see module docstring). Any one marker
+# identifies it (the <title>, the <noscript> fallback or the form that posts the
+# solved proof-of-work), so a copy tweak doesn't bring the false negative back.
+_SECURITY_CHALLENGE_RE = re.compile(
+    r'Verificação\s+de\s+segurança|JavaScript\s+is\s+required|action="/_challenge"',
+    re.IGNORECASE,
+)
+# No trailing period: the dispatcher appends ". Tente novamente ...".
+_SECURITY_CHALLENGE_ERROR = (
+    "LexML bloqueado pela verificação de segurança do Senado (desafio anti-bot "
+    "com JavaScript). A pesquisa não chegou a ser feita, então isto não indica "
+    "ausência de jurisprudência. Tente mais tarde ou use as ferramentas "
+    "dedicadas de cada tribunal"
+)
 
 
 def _clean(fragment: str) -> str:
@@ -101,11 +127,21 @@ class LexmlLegalPrecedent(BaseLegalPrecedent):
 
     @classmethod
     def _parse_results(cls, page_html: str) -> list[Self]:
-        """Extract jurisprudence records from the XTF search HTML."""
+        """Extract jurisprudence records from the XTF search HTML.
+
+        :raises RuntimeError: when the page is the Senado's anti-bot
+            interstitial instead of search results.
+        """
         blocks = _DOCHIT_BLOCK_RE.findall(page_html)
         if not blocks:
+            # The no-results guard runs first so that a search FOR the gate's
+            # words (echoed back on an empty results page) isn't mistaken for it.
             if _NO_RESULTS_RE.search(page_html):
                 _LOGGER.info("LexML returned no results for the search")
+            elif _SECURITY_CHALLENGE_RE.search(page_html):
+                # Returning [] here would surface as "Nenhum resultado
+                # encontrado", which reads as "no case law exists".
+                raise RuntimeError(_SECURITY_CHALLENGE_ERROR)
             else:
                 _LOGGER.warning(
                     "LexML: no docHit blocks found (template may have changed)"
@@ -210,7 +246,9 @@ class LexmlLegalPrecedent(BaseLegalPrecedent):
                     len(response.content),
                 )
                 response.raise_for_status()
-                # response.text honors the UTF-8 charset from the header.
+                # response.text honors the UTF-8 charset from the header. The
+                # parser's anti-bot RuntimeError is deliberately not caught
+                # below (no retry): an immediate retry gets the same page.
                 return cls._parse_results(response.text)
 
             except httpx.HTTPError as exc:

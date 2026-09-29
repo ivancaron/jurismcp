@@ -46,6 +46,12 @@ tool, and use the dedicated tools for depth in a specific court. Records carry
 metadata, the ementa when indexed, and a `urn:lex` resolver link to the official
 full text. The legacy SRU/XML endpoint was decommissioned, so results are scraped
 from the server-rendered UTF-8 HTML of the XTF search; no browser is needed.
+Since 29/09/2026 the portal answers automated requests with the Senado Federal's
+anti-bot check ("Verificação de segurança", a JavaScript proof-of-work page served
+with HTTP 200). The tool detects that page and returns an explicit error
+(`[ERRO] LEXML: ...`) instead of an empty list, which would read as "no case law
+found"; it does not try to solve or bypass the check. While the block lasts, use
+the dedicated court tools.
 
 **BNP** (Banco Nacional de Precedentes, `bnp.pdpj.jus.br`) is the CNJ's official
 registry of QUALIFIED precedents — súmulas, súmulas vinculantes, repercussão
@@ -108,7 +114,9 @@ uv run patchright install
   of Espírito Santo (TJES). Uses TJES public REST API.
 - `LexmlLegalPrecedentsRequest`: Research **federated** jurisprudence aggregated by the LexML portal
   across many Brazilian courts at once. Best for breadth/discovery; returns metadata, the ementa
-  when indexed, and a `urn:lex` link to the source. Uses a direct HTTP GET (no browser).
+  when indexed, and a `urn:lex` link to the source. Uses a direct HTTP GET (no browser). While the
+  portal sits behind the Senado's anti-bot check (since 29/09/2026), it returns an explicit
+  `[ERRO] LEXML` error instead of results.
 - `JurisprudenciasAiLegalPrecedentsRequest`: **Optional, opt-in** multi-court source backed by the
   Jurisprudencias.ai REST API (a third-party aggregator, not an official portal). Requires the
   `JURISPRUDENCIAS_AI_TOKEN` environment variable (a `jur_...` token from
