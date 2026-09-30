@@ -462,6 +462,84 @@ class TestLexmlParseResults:
         assert LexmlLegalPrecedent._parse_results(html) == []
 
 
+# Trimmed from the live interstitial captured on 29/09/2026: the Senado
+# Federal's anti-bot gate answers HTTP 200 with a JavaScript proof-of-work page
+# instead of the XTF results. Styles, logo and script were removed; the hidden
+# inputs carry placeholder values (the live page embeds the client's IP).
+_LEXML_CHALLENGE_FIXTURE = textwrap.dedent(
+    """\
+    <!DOCTYPE html>
+    <meta name="viewport" content="width=device-width">
+    <title>Verificação de segurança — Senado Federal</title>
+    <form method="post" target="post" action="/_challenge" name="challenge">
+      <input type="hidden" name="ip" value="203.0.113.10">
+      <input type="hidden" name="ts" value="1790713061">
+      <input type="hidden" name="diff" value="3">
+      <input type="hidden" name="tries" value="">
+    </form>
+    <main class="sf-main">
+      <div id="progress">
+        <div id="state-checking" class="sf-state active">
+          <div class="sf-spinner"></div>
+          <div class="sf-title">Verificando sua conexão</div>
+          <div class="sf-sub" id="checkingMsg">Estamos confirmando que este acesso é legítimo antes de liberar o conteúdo. Isso leva apenas alguns segundos.</div>
+        </div>
+      </div>
+    </main>
+    <noscript>
+      JavaScript is required to use this page.
+    </noscript>
+    <footer class="sf-footer">Senado Federal</footer>
+    """
+)
+
+
+class TestLexmlSecurityChallenge:
+    """Since 29/09/2026 LexML may answer with the Senado's anti-bot page
+    instead of results. The parser must raise, because an empty list would
+    surface as "Nenhum resultado encontrado" (a false negative)."""
+
+    def test_raises_on_security_challenge_page(self) -> None:
+        with pytest.raises(
+            RuntimeError, match="verificação de segurança do Senado"
+        ) as exc_info:
+            LexmlLegalPrecedent._parse_results(_LEXML_CHALLENGE_FIXTURE)
+        assert "não indica ausência de jurisprudência" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            pytest.param(
+                "<title>Verificação de segurança — Senado Federal</title>",
+                id="title",
+            ),
+            pytest.param(
+                "<noscript>JavaScript is required to use this page.</noscript>",
+                id="noscript",
+            ),
+            pytest.param(
+                '<form method="post" action="/_challenge" name="challenge"></form>',
+                id="challenge_form",
+            ),
+        ],
+    )
+    def test_each_marker_is_enough(self, marker: str) -> None:
+        """A copy tweak on the interstitial must not bring the false
+        negative back: any single marker identifies it."""
+        page = f"<!DOCTYPE html>{marker}<footer>Senado Federal</footer>"
+        with pytest.raises(RuntimeError, match="verificação de segurança"):
+            LexmlLegalPrecedent._parse_results(page)
+
+    def test_no_results_page_echoing_the_markers_is_not_a_challenge(self) -> None:
+        """A search FOR the gate's words that finds nothing is a genuine
+        empty result, not the gate."""
+        html = (
+            '<html><body><input name="keyword" value="verificação de segurança">'
+            "<div class='results'>Nenhum documento encontrado</div></body></html>"
+        )
+        assert LexmlLegalPrecedent._parse_results(html) == []
+
+
 # ---------------------------------------------------------------------------
 # Jurisprudencias.ai — helpers + `_parse_results` (token-gated multi-court API)
 # ---------------------------------------------------------------------------
