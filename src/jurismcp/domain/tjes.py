@@ -12,7 +12,7 @@ most relevant for jurisprudence research.
 
 import logging
 import re
-from typing import TYPE_CHECKING, ClassVar, Self, override
+from typing import TYPE_CHECKING, Any, ClassVar, Self, override
 
 import httpx
 
@@ -27,6 +27,7 @@ _SEARCH_URL = "https://sistemas.tjes.jus.br/consulta-jurisprudencia/api/search"
 _RESULTS_PER_PAGE = 10
 _MAX_RETRIES = 2
 _HTTP_TIMEOUT = 30.0
+_ISO_DATE_LEN = 10  # length of a "yyyy-mm-dd" prefix
 
 _HEADERS = {
     "User-Agent": (
@@ -81,6 +82,9 @@ _ADVANCED_QUERY_PATTERN = re.compile(
     r'["()~^*?:]|(?:^|\s)[+\-]\S|\b(?:AND|OR|NOT)\b'
 )
 
+# Below this many distinctive terms there is nothing to AND.
+_MIN_AND_TERMS = 2
+
 
 def _build_and_query(prompt: str) -> str:
     """Force AND semantics on the TJES (Solr ``pje2g``) endpoint.
@@ -112,7 +116,7 @@ def _build_and_query(prompt: str) -> str:
     ]
     # 0-1 distinctive term: nothing to AND; the single-term OR default already
     # ranks it correctly (and dropping to "" would broaden, not narrow).
-    if len(required) < 2:
+    if len(required) < _MIN_AND_TERMS:
         return q
     return " ".join(f"+{tok}" for tok in required)
 
@@ -147,13 +151,43 @@ def _detect_winning_dissent(
     return None, False
 
 
+def _build_metadata_header(doc: dict[str, Any]) -> str:
+    """Build the ``[Processo | Classe | Relator(a) | Orgao Julgador | Data]``
+    header that prefixes the ementa ("" when the doc carries none of them)."""
+    nr_processo = doc.get("nr_processo", "")
+    classe = doc.get("classe_judicial", "")
+    magistrado = doc.get("magistrado", "")
+    orgao = doc.get("orgao_julgador", "")
+    dt = doc.get("dt_juntada", "")
+
+    metadata_parts: list[str] = []
+    if nr_processo:
+        metadata_parts.append(f"Processo: {nr_processo}")
+    if classe:
+        metadata_parts.append(f"Classe: {classe}")
+    if magistrado:
+        metadata_parts.append(f"Relator(a): {magistrado}")
+    if orgao:
+        metadata_parts.append(f"Orgao Julgador: {orgao}")
+    if dt:
+        # Format date from ISO to DD/MM/YYYY
+        date_part = dt[:_ISO_DATE_LEN] if len(dt) >= _ISO_DATE_LEN else dt
+        try:
+            year, month, day = date_part.split("-")
+            metadata_parts.append(f"Data: {day}/{month}/{year}")
+        except (ValueError, IndexError):
+            metadata_parts.append(f"Data: {date_part}")
+
+    return "[" + " | ".join(metadata_parts) + "]\n" if metadata_parts else ""
+
+
 class TjesLegalPrecedent(BaseLegalPrecedent):
     """Model for a legal precedent from the Tribunal de Justica do Espirito Santo (TJES)."""
 
     requires_browser: ClassVar[bool] = False  # direct HTTP GET to TJES REST API
 
     @classmethod
-    def _parse_results(cls, data: dict) -> list[Self]:
+    def _parse_results(cls, data: dict[str, Any]) -> list[Self]:
         """Extract legal precedents from the API JSON response.
 
         Each document in the response has fields including:
@@ -196,43 +230,14 @@ class TjesLegalPrecedent(BaseLegalPrecedent):
             if not ementa:
                 continue
 
-            # Enrich ementa with metadata for better context
-            nr_processo = doc.get("nr_processo", "")
-            classe = doc.get("classe_judicial", "")
-            magistrado = doc.get("magistrado", "")
-            orgao = doc.get("orgao_julgador", "")
-            dt = doc.get("dt_juntada", "")
-
             # Build a rich summary with metadata header + ementa
-            metadata_parts = []
-            if nr_processo:
-                metadata_parts.append(f"Processo: {nr_processo}")
-            if classe:
-                metadata_parts.append(f"Classe: {classe}")
-            if magistrado:
-                metadata_parts.append(f"Relator(a): {magistrado}")
-            if orgao:
-                metadata_parts.append(f"Orgao Julgador: {orgao}")
-            if dt:
-                # Format date from ISO to DD/MM/YYYY
-                date_part = dt[:10] if len(dt) >= 10 else dt
-                try:
-                    year, month, day = date_part.split("-")
-                    metadata_parts.append(f"Data: {day}/{month}/{year}")
-                except (ValueError, IndexError):
-                    metadata_parts.append(f"Data: {date_part}")
-
-            if metadata_parts:
-                metadata_header = " | ".join(metadata_parts)
-                summary = f"[{metadata_header}]\n{ementa}"
-            else:
-                summary = ementa
+            summary = _build_metadata_header(doc) + ementa
 
             # Detect winning dissent: API returns the redator (winner) as
             # `magistrado`, but the original relator may differ. We parse the
             # acórdão text to recover this when it occurs.
             relator_original, divergencia_vencedora = _detect_winning_dissent(
-                acordao_full, magistrado
+                acordao_full, doc.get("magistrado", "")
             )
 
             results.append(

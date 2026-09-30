@@ -154,6 +154,102 @@ class TestDetectWinningDissent:
 
 
 # ---------------------------------------------------------------------------
+# TJES — `_parse_results` (REST API JSON)
+# ---------------------------------------------------------------------------
+
+
+# Shaped like the REST API's ``{docs, total}`` payload (fields listed in the
+# parser docstring): HTML ementa/acordao plus flat metadata fields.
+_TJES_FIXTURE = {
+    "total": 5,
+    "docs": [
+        {
+            "nr_processo": "5001234-56.2024.8.08.0024",
+            "classe_judicial": "APELAÇÃO CÍVEL",
+            "magistrado": "HELIMAR PINTO",
+            "orgao_julgador": "1ª Câmara Cível",
+            "dt_juntada": "2025-09-05T14:32:10Z",
+            "assunto_principal": "Responsabilidade Civil",
+            "ementa": "<p>EMENTA: APELAÇÃO CÍVEL. <b>TURISMO DE AVENTURA.</b> TIROLESA.</p>",
+            "acordao": "<p>ACÓRDÃO</p><p>Vistos, relatados e discutidos.</p>",
+        },
+        {
+            # Winning dissent: the API indexes the redator as `magistrado`,
+            # while the acórdão names a different original relator.
+            "nr_processo": "5007654-32.2023.8.08.0035",
+            "magistrado": "JANETE VARGAS SIMOES",
+            "dt_juntada": "05/09/2025",
+            "ementa": "<p>EMENTA: APELAÇÃO CÍVEL. RECURSO PROVIDO.</p>",
+            "acordao": (
+                "<p>VOTO VENCEDOR</p>"
+                "<p>Relator: Desembargador Jose Paulo Calmon Nogueira da Gama</p>"
+                "<p>Sessao Virtual de 01/09/25 a 05/09/25</p>"
+            ),
+        },
+        {
+            # "Voto servindo como ementa": empty ementa and no metadata.
+            "ementa": "",
+            "acordao": (
+                "<p>VOTO SERVINDO COMO EMENTA.</p>"
+                + "<p>Fundamentação do voto.</p>" * 100
+            ),
+        },
+        # No usable text -> both must be skipped.
+        {"nr_processo": "0000001-00.2025.8.08.0001", "ementa": "   "},
+        {"nr_processo": "0000002-00.2025.8.08.0002", "ementa": "<p> </p>"},
+    ],
+}
+
+
+class TestTjesParseResults:
+    """The parser prefixes the cleaned ementa with a bracketed metadata
+    header, keeps the cleaned acórdão as ``full_text``, falls back to the
+    acórdão when the ementa is empty and flags winning dissents."""
+
+    def test_parses_and_skips_docs_without_text(self) -> None:
+        results = TjesLegalPrecedent._parse_results(_TJES_FIXTURE)
+        assert len(results) == 3
+
+    def test_metadata_header_and_html_cleanup(self) -> None:
+        r = TjesLegalPrecedent._parse_results(_TJES_FIXTURE)[0]
+        assert r.summary == (
+            "[Processo: 5001234-56.2024.8.08.0024 | Classe: APELAÇÃO CÍVEL"
+            " | Relator(a): HELIMAR PINTO | Orgao Julgador: 1ª Câmara Cível"
+            " | Data: 05/09/2025]\n"
+            "EMENTA: APELAÇÃO CÍVEL. TURISMO DE AVENTURA. TIROLESA."
+        )
+        assert r.full_text == "ACÓRDÃO Vistos, relatados e discutidos."
+        assert r.relator_original is None
+        assert r.divergencia_vencedora is False
+
+    def test_absent_fields_omitted_and_non_iso_date_kept(self) -> None:
+        r = TjesLegalPrecedent._parse_results(_TJES_FIXTURE)[1]
+        assert r.summary == (
+            "[Processo: 5007654-32.2023.8.08.0035"
+            " | Relator(a): JANETE VARGAS SIMOES | Data: 05/09/2025]\n"
+            "EMENTA: APELAÇÃO CÍVEL. RECURSO PROVIDO."
+        )
+
+    def test_winning_dissent_recovers_original_relator(self) -> None:
+        r = TjesLegalPrecedent._parse_results(_TJES_FIXTURE)[1]
+        assert r.divergencia_vencedora is True
+        assert r.relator_original == "Jose Paulo Calmon Nogueira da Gama"
+
+    def test_empty_ementa_falls_back_to_truncated_acordao(self) -> None:
+        r = TjesLegalPrecedent._parse_results(_TJES_FIXTURE)[2]
+        assert r.full_text is not None
+        assert len(r.full_text) > 2000
+        # No metadata -> no bracketed header; the summary is the acórdão
+        # truncated to its first 2000 characters.
+        assert r.summary == r.full_text[:2000]
+        assert r.relator_original is None
+
+    def test_returns_empty_when_no_docs(self) -> None:
+        assert TjesLegalPrecedent._parse_results({"docs": [], "total": 0}) == []
+        assert TjesLegalPrecedent._parse_results({}) == []
+
+
+# ---------------------------------------------------------------------------
 # STJ — `_parse_ementas`
 # ---------------------------------------------------------------------------
 
